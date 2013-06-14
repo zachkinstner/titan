@@ -25,6 +25,8 @@ import com.thinkaurelius.titan.graphdb.query.*;
 import com.thinkaurelius.titan.graphdb.query.keycondition.KeyAnd;
 import com.thinkaurelius.titan.graphdb.query.keycondition.KeyAtom;
 import com.thinkaurelius.titan.graphdb.query.keycondition.KeyCondition;
+import com.thinkaurelius.titan.graphdb.query.keycondition.KeyNot;
+import com.thinkaurelius.titan.graphdb.query.keycondition.KeyOr;
 import com.thinkaurelius.titan.graphdb.relations.AttributeUtil;
 import com.thinkaurelius.titan.graphdb.relations.RelationIdentifier;
 import com.thinkaurelius.titan.graphdb.relations.StandardEdge;
@@ -55,6 +57,7 @@ import com.thinkaurelius.titan.util.datastructures.IterablesUtil;
 import com.thinkaurelius.titan.util.datastructures.Retriever;
 import com.tinkerpop.blueprints.Direction;
 import com.tinkerpop.blueprints.Edge;
+import com.tinkerpop.blueprints.Element;
 import com.tinkerpop.blueprints.Vertex;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -564,6 +567,7 @@ public class StandardTitanTx extends TitanBlueprintsTransaction {
 
         @Override
         public Iterator<TitanRelation> execute(final VertexCentricQuery query) {
+            // If the vertex exists only in memory, then we can't possibly have edges for it in storage
             if (query.getVertex().isNew()) return Iterators.emptyIterator();
 
             final EdgeSerializer edgeSerializer = graph.getEdgeSerializer();
@@ -642,17 +646,47 @@ public class StandardTitanTx extends TitanBlueprintsTransaction {
         public Iterator<TitanElement> getNew(final StandardElementQuery query) {
             Preconditions.checkArgument(query.getType()== StandardElementQuery.Type.VERTEX || query.getType()== StandardElementQuery.Type.EDGE);
             if (query.getType()==StandardElementQuery.Type.VERTEX && hasModifications()) {
-                //Collect all keys from the query - ASSUMPTION: query is an AND of KeyAtom
+                //Collect all keys from the query
                 final Set<TitanKey> keys = Sets.newHashSet();
                 KeyAtom<TitanKey> standardIndexKey = null;
                 for (KeyCondition<TitanKey> cond : query.getCondition().getChildren()) {
-                    KeyAtom<TitanKey> atom = (KeyAtom<TitanKey>)cond;
-                    if (atom.getRelation()==Cmp.EQUAL && isVertexIndexProperty(atom.getKey()))
-                        standardIndexKey = atom;
-                    keys.add(atom.getKey());
+                    if (cond instanceof KeyAtom) {
+                        KeyAtom<TitanKey> atom = (KeyAtom<TitanKey>)cond;
+                        if (atom.getRelation()==Cmp.EQUAL && isVertexIndexProperty(atom.getKey()))
+                            standardIndexKey = atom;
+                        keys.add(atom.getKey());
+                    } else if (cond instanceof KeyOr || cond instanceof KeyNot) {
+                        for (KeyCondition<TitanKey> c : cond.getChildren()) {
+                            KeyAtom<TitanKey> atom = (KeyAtom<TitanKey>)c;
+                            keys.add(atom.getKey());    
+                        }
+                    }
                 }
+
+                /*
+                 * Find vertices with in-memory modifications that might match
+                 * the query. The vertices iterator must contain at least the
+                 * full set of results with in-memory modifications, but it
+                 * might also be a superset of the results. We'll filter out
+                 * non-matching vertices later in this method.
+                 */
                 Iterator<TitanVertex> vertices;
                 if (standardIndexKey==null) {
+                    /*
+                     * No KeyAtoms in the top-level KeyAnd used an index. We
+                     * have to iterate over all relations added and/or deleted
+                     * by this transaction to check for in-memory query matches.
+                     *
+                     * The implementation of execute(...) ignores all vertices
+                     * for which InternalVertex#hasAddedRelations() or
+                     * InternalVertex#hasRemovedRelations() returns true. See
+                     * execute(...)'s invocation of isDeleted(...).
+                     * 
+                     * Because execute(...) can't return vertices with in-memory
+                     * incident modified relations, we have to iterate over all
+                     * of these and check them for query matches.
+                     */
+                    
                     Set<TitanVertex> vertexSet = Sets.newHashSet();
                     for (TitanRelation r : addedRelations.getView(new Predicate<InternalRelation>() {
                         @Override
@@ -662,6 +696,7 @@ public class StandardTitanTx extends TitanBlueprintsTransaction {
                     })) {
                         vertexSet.add(((TitanProperty)r).getVertex());
                     }
+
                     for (TitanRelation r : deletedRelations.values()) {
                         if (keys.contains(r.getType())) {
                             TitanVertex v = ((TitanProperty)r).getVertex();
@@ -670,6 +705,18 @@ public class StandardTitanTx extends TitanBlueprintsTransaction {
                     }
                     vertices=vertexSet.iterator();
                 } else {
+                    /* This is an optimization.
+                     * 
+                     * At least one KeyAtom in the top-level KeyAnd used an
+                     * index.  Because this KeyAtom is part of the top-level
+                     * KeyAnd (i.e. set intersection) defining the query, its
+                     * associated vertices form a possibly improper superset
+                     * of the set of vertices matching the complete query.
+                     * 
+                     * Here, we retrieve new vertexindex entries associated
+                     * with the KeyAtom we found in the top-level KeyAnd for
+                     * the query.
+                     */
                     vertices = Iterators.transform(newVertexIndexEntries.get(standardIndexKey.getCondition(),standardIndexKey.getKey()).iterator(),new Function<TitanProperty, TitanVertex>() {
                         @Nullable
                         @Override
@@ -679,7 +726,7 @@ public class StandardTitanTx extends TitanBlueprintsTransaction {
                     });
                 }
 
-
+                // Remove non-matching vertices from candidiate iterator and return
                 return (Iterator)Iterators.filter(vertices,new Predicate<TitanVertex>() {
                     @Override
                     public boolean apply(@Nullable TitanVertex vertex) {
@@ -710,7 +757,7 @@ public class StandardTitanTx extends TitanBlueprintsTransaction {
                 return false;
             } else throw new IllegalArgumentException("Unexpected type: " + query.getType());
         }
-
+        
         @Override
         public Iterator<TitanElement> execute(final StandardElementQuery query) {
             Iterator<TitanElement> iter = null;
@@ -727,42 +774,55 @@ public class StandardTitanTx extends TitanBlueprintsTransaction {
                         return query.matches(element);
                     }
                 });
-            } else {
+            } else { // Query has an index
                 String index = query.getIndex();
                 log.debug("Answering query [{}] with index {}",query,index);
-                //Filter out everything not covered by the index
                 KeyCondition<TitanKey> condition = query.getCondition();
-                //ASSUMPTION: query is an AND of KeyAtom
+                //ASSUMPTION: query is a KeyAnd and its children are either KeyAtom or (KeyOr with KeyAtom as children) 
                 Preconditions.checkArgument(condition instanceof KeyAnd);
                 Preconditions.checkArgument(condition.hasChildren());
-                List<KeyCondition<TitanKey>> newConds = Lists.newArrayList();
-
-                boolean needsFilter = false;
-                for (KeyCondition<TitanKey> c : condition.getChildren()) {
-                    KeyAtom<TitanKey> atom = (KeyAtom<TitanKey>)c;
-                    if (getGraph().getIndexInformation(index).supports(atom.getKey().getDataType(),atom.getRelation()) &&
-                            atom.getKey().hasIndex(index,query.getType().getElementType()) && atom.getCondition()!=null) {
-                        newConds.add(atom);
+                // check children
+                for (KeyCondition<?> c : query.getCondition().getChildren()) {
+                    if (c instanceof KeyOr) {
+                        Preconditions.checkArgument(c.hasChildren());
+                        for (KeyCondition<?> oc : c.getChildren()) {
+                            Preconditions.checkArgument(oc instanceof KeyAtom);
+                        }
                     } else {
-                        log.debug("Filtered out atom [{}] from query [{}] because it is not indexed or not covered by the index");
-                        needsFilter = true;
+                        Preconditions.checkArgument(c instanceof KeyAtom);
                     }
                 }
-                Preconditions.checkArgument(!newConds.isEmpty(),"Invalid index assignment [%s] to query [%s]",index, query);
+
+                /*
+                 * Traverse the query condition, building a copy called
+                 * indexCondition in which all atoms which can't be satisfied by
+                 * the index have been excluded. Excluded conditions (i.e. those
+                 * not covered by the index) will be applied in-memory after a
+                 * query using indexCondition has returned results.
+                 */
+                final KeyCondition<TitanKey> indexCondition = removedUnindexedAtomsFromCondition(index, condition, query);
+                final boolean needsFilter;
                 final StandardElementQuery indexQuery;
-                if (needsFilter) {
-                    Preconditions.checkArgument(!newConds.isEmpty(),"Query has been assigned an index [%s] in error: %s",query.getIndex(),query);
-                    indexQuery = new StandardElementQuery(query.getType(),KeyAnd.of(newConds.toArray(new KeyAtom[newConds.size()])),query.getLimit(),index);
-                } else {
+                if (condition.equals(indexCondition)) {
+                    needsFilter = false;
                     indexQuery = query;
+                } else {
+                    needsFilter = true;
+                    Preconditions.checkNotNull(indexCondition, "Invalid index assignment [%s] to query [%s]",index, query);
+                    Preconditions.checkArgument(indexCondition.hasChildren() && indexCondition.getChildren().iterator().hasNext(), "Invalid index assignment [%s] to query [%s]",index, query);
+                    indexQuery = new StandardElementQuery(query.getType(),indexCondition,query.getLimit(),query.getSkip(),index);
                 }
+                
                 try {
+                    // Get index hits from cache or retrieve them from storage in case of a cache miss
                     iter = Iterators.transform(indexCache.get(indexQuery,new Callable<List<Object>>() {
                         @Override
                         public List<Object> call() throws Exception {
+                            // Cache miss -- retrieve index hits from storage
                             return graph.elementQuery(indexQuery,txHandle);
                         }
                     }).iterator(),new Function<Object, TitanElement>() {
+                        // Convert vertex IDs Longs and RelationIdentifiers into TitanVertex/TitanElement
                         @Nullable
                         @Override
                         public TitanElement apply(@Nullable Object id) {
@@ -772,14 +832,40 @@ public class StandardTitanTx extends TitanBlueprintsTransaction {
                             else throw new IllegalArgumentException("Unexpected id type: " + id);
                         }
                     });
+                    // iter now contains TitanElements representing index hits
                 } catch (Exception e) {
                     throw new TitanException("Could not call index",e);
                 }
+
+                // Cull deleted/removed elements from iter, applying a filter
+                // for non-index-satisfiable KeyAtoms as necessary
                 if (needsFilter) {
                     iter = Iterators.filter(iter,new Predicate<TitanElement>() {
                         @Override
                         public boolean apply(@Nullable TitanElement element) {
+                            
+                            /*
+                             * Note that we call query.matches(element).
+                             * This checks every condition in the query,
+                             * not just KeyAtoms uncovered by the index.
+                             * This means we perform a redundant check
+                             * on any KeyAtoms covered by the index.
+                             * We could eliminate this redundant checking
+                             * by constructing a new query object containing
+                             * only KeyAtoms uncovered by the index.
+                             * 
+                             * Note that isDeleted() returns 
+                             * !query.matches(element) for any vertices with
+                             * modified relations (added or removed
+                             * relations) in memory. Therefore this method
+                             * can never return vertices that match the query
+                             * that have any in-memory property changes,
+                             * even if the property changes are irrelevant
+                             * for the query in question. Such vertices are
+                             * handled in getNew(...).
+                             */
                             return element!=null && !element.isRemoved() && !isDeleted(query,element) && query.matches(element);
+                            
                         }
                     });
                 } else {
@@ -795,6 +881,64 @@ public class StandardTitanTx extends TitanBlueprintsTransaction {
         }
 
     };
+    
+    private KeyCondition<TitanKey> removedUnindexedAtomsFromCondition(String index, KeyCondition<TitanKey> kc, StandardElementQuery query) {
+        if (kc instanceof KeyAtom) {
+            KeyAtom<TitanKey> atom = (KeyAtom<TitanKey>)kc;
+            if (getGraph().getIndexInformation(index).supports(atom.getKey().getDataType(),atom.getRelation()) &&
+                    atom.getKey().hasIndex(index,query.getType().getElementType()) && atom.getCondition()!=null) {
+                // this atom is covered by the index
+                return kc;
+            } else {
+                // this atom wasn't covered by the index
+                log.debug("Filtered out atom [{}] from query [{}] because it is not indexed or not covered by the index", kc, query);
+                return null;
+            }
+        } else if (kc instanceof KeyAnd || kc instanceof KeyOr || kc instanceof KeyNot) {
+            List<KeyCondition<TitanKey>> replacementConds =
+                    new ArrayList<KeyCondition<TitanKey>>(); // TODO size estimate?
+            Preconditions.checkArgument(kc.hasChildren());
+            int childCount = 0;
+            for (KeyCondition<TitanKey> child : kc.getChildren()) {
+                childCount++;
+                KeyCondition<TitanKey> filteredChild = removedUnindexedAtomsFromCondition(index, child, query);
+                if (null != filteredChild) {
+                    replacementConds.add(filteredChild);
+                }
+            }
+            if (0 < replacementConds.size()) {
+                // at least one atom within the child conditions was covered by the index
+                KeyCondition[] a = replacementConds.toArray(new KeyCondition[replacementConds.size()]);
+                if (kc instanceof KeyAnd) {
+                    return KeyAnd.of(a);
+                } else if (kc instanceof KeyOr) {
+                    /*
+                     * In the current implementation of standard index matching
+                     * in IndexSerializer, the index must satisfy every
+                     * condition in a KeyOr or else valid query matches could be
+                     * dropped. Nonstandard indexes might handle this correctly,
+                     * but for now we'll apply partially-indexed KeyOrs in
+                     * memory so that we don't run afoul of the standard index
+                     * implementation.
+                     */
+                    KeyOr<TitanKey> candidate = KeyOr.of(a);
+                    if (candidate.equals(kc)) {
+                        return kc;
+                    } else {
+                        return null;
+                    }
+                } else {
+                    Preconditions.checkArgument(kc instanceof KeyNot);
+                    return null; // TODO ?
+                }
+            } else {
+                // every atom within the child conditions was not covered by the index
+                return null;
+            }
+        } else {
+            throw new IllegalArgumentException("Expected condition to contain only KeyAnd, KeyOr, KeyNot, and KeyAtom, but encountered this: " + kc);
+        }
+    }
 
     @Override
     public TitanGraphQueryBuilder query() {

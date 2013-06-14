@@ -3,6 +3,7 @@ package com.thinkaurelius.titan.graphdb;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Iterators;
 import com.thinkaurelius.titan.core.*;
 import com.thinkaurelius.titan.graphdb.configuration.GraphDatabaseConfiguration;
 import com.thinkaurelius.titan.graphdb.internal.InternalType;
@@ -316,6 +317,36 @@ public abstract class TitanGraphTest extends TitanGraphTestCommon {
             tx=null;
         }
         newTx();
+    }
+    
+    @Test
+    public void testUncommittedPropertyRemovalAndQuery() {
+        final String prop = "foo";
+        final String val  = "bar";
+        
+        // Setup initial graph conditions
+        tx.makeType().name(prop).dataType(String.class).unique(Direction.OUT).makePropertyKey();
+        clopen();
+        Vertex v1 = graph.addVertex(null);
+        v1.setProperty(prop, val);
+        
+        // Commit
+        clopen();
+        
+        // Verify that our graph conditions held across the commit unchanged
+        v1 = graph.getVertex(v1);
+        assertNotNull(v1);
+        assertEquals(val, v1.getProperty(prop));
+        assertEquals(1, Iterators.size(graph.query().has(prop, val).vertices().iterator()));
+        
+        // Remove property
+        v1.removeProperty(prop);
+        
+        // Check removal with both a graph query and a property retrieval
+        assertNull(v1.getProperty(prop));
+        assertEquals(0, Iterators.size(graph.query().has(prop, val).vertices().iterator()));
+        
+        graph.commit();
     }
 
     @Test
@@ -1007,8 +1038,8 @@ public abstract class TitanGraphTest extends TitanGraphTestCommon {
         }
         assertEquals(10, v.query().labels("connect").direction(OUT).interval("time", 3, 31).count());
         assertEquals(33, v.query().labels("connect").direction(OUT).count());
-        assertEquals(33, v.query().labels("connect").has("undefined", null).direction(OUT).count());
-        assertEquals(0, v.query().labels("connect").direction(OUT).has("time", null).count());
+        assertEquals(33, v.query().labels("connect").direction(OUT).has("undefined", (Object)null).count());
+        assertEquals(0,  v.query().labels("connect").direction(OUT).has("time", (Object)null).count());
         assertEquals(10, v.query().labels("connect").direction(OUT).interval("time", 3, 31).vertexIds().size());
         assertEquals(10, Iterables.size(v.query().labels("connect").direction(OUT).interval("time", 3, 31).vertices()));
         assertEquals(1, v.query().has("time", 1).count());
@@ -1043,7 +1074,7 @@ public abstract class TitanGraphTest extends TitanGraphTestCommon {
         assertEquals(0, v.query().labels("follows").has("time", 10, Query.Compare.LESS_THAN).count());
 
 
-        assertEquals(0, v.query().labels("connect").direction(OUT).has("time", null).count());
+        assertEquals(0, v.query().labels("connect").direction(OUT).has("time", (Object)null).count());
         assertEquals(10, v.query().labels("connect").direction(OUT).interval("time", 3, 31).count());
         assertEquals(10, v.query().labels("connect").direction(OUT).interval("time", 3, 31).vertexIds().size());
         assertEquals(10, Iterables.size(v.query().labels("connect").direction(OUT).interval("time", 3, 31).vertices()));

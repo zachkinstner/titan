@@ -290,16 +290,22 @@ public class VertexCentricQueryBuilder implements TitanVertexQuery {
 
     @Override
     public VertexQuery has(String key, Object... values) {
-        throw new UnsupportedOperationException("has(key, values) not yet implemented");
+        log.warn("has(key, values...) is unimplemented and has no effect"); // TODO implement
+//        throw new IllegalArgumentException();
+        return this;
     }
 
     @Override
     public VertexQuery hasNot(String key, Object... values) {
-        throw new UnsupportedOperationException("hasNot(key, values) not yet implemented");
+        log.warn("hasNot(key, values...) is unimplemented and has no effect"); // TODO implement
+//        throw new IllegalArgumentException();
+        return this;
     }
 
     @Override
     public VertexQuery limit(long skip, long take) {
-        throw new UnsupportedOperationException("limit(skip, take) not yet implemented");
+        log.warn("limit(skip, take) is unimplemented and has no effect"); // TODO implement
+//        throw new IllegalArgumentException();
+        return this;
     }
 }
